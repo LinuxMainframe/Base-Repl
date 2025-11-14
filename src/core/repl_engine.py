@@ -1,0 +1,509 @@
+"""
+ASYNC REPL ENGINE CORE
+
+Async-aware REPL engine with background task management.
+Allows emitting asyncio tasks while maintaining interactive prompt.
+
+Author: Enhanced by Claude
+Date: November 14th, 2025
+Version: v0.1.0 - Async implementation
+"""
+import sys
+import signal
+import asyncio
+import readline
+from typing import Callable, Dict, List, Optional, Any, Coroutine
+from enum import Enum
+from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
+
+
+class CommandResult(Enum):
+    """Command result exit status"""
+    SUCCESS = "success"
+    ERROR = "error"
+    EXIT = "exit"
+
+
+@dataclass
+class CommandContext:
+    """Execution context passed to the command"""
+    args: List[str]
+    raw_input: str
+    session_data: Dict[str, Any] = field(default_factory=dict)
+    repl_instance: Optional['AsyncREPLEngine'] = None  # Reference to REPL for task emission
+    
+    def get(self, key: str, default: Any = None) -> Any:
+        """Get session data"""
+        return self.session_data.get(key, default)
+    
+    def set(self, key: str, value: Any) -> None:
+        """Set session data"""
+        self.session_data[key] = value
+    
+    def emit_task(self, coro: Coroutine, name: Optional[str] = None) -> asyncio.Task:
+        """Emit a background task"""
+        if self.repl_instance:
+            return self.repl_instance.create_background_task(coro, name)
+        raise RuntimeError("REPL instance not available in context")
+
+
+@dataclass
+class CommandMetadata:
+    """Metadata for registered commands"""
+    func: Callable
+    name: str
+    description: str = ""
+    usage: str = ""
+    aliases: List[str] = field(default_factory=list)
+    hidden: bool = False
+    is_async: bool = False  # Whether the command is async
+
+
+class AsyncREPLEngine:
+    """
+    Async-aware REPL Engine with background task management.
+    
+    Features:
+    - Decorator-based command registration (sync and async)
+    - Background task emission and management
+    - Non-blocking input with asyncio
+    - Task monitoring and cancellation
+    """
+    
+    def __init__(
+        self,
+        prompt: str = "$-> ",
+        history_file: Optional[str] = None,
+        enable_history: bool = True
+    ):
+        self.prompt = prompt
+        self.history_file = history_file
+        self.enable_history = enable_history
+        
+        # Command registry
+        self._commands: Dict[str, CommandMetadata] = {}
+        
+        # Session data
+        self._session_data: Dict[str, Any] = {}
+        
+        # Hooks
+        self._pre_execute_hooks: List[Callable] = []
+        self._post_execute_hooks: List[Callable] = []
+        self._startup_hooks: List[Callable] = []
+        self._shutdown_hooks: List[Callable] = []
+        
+        # Async state
+        self._running = False
+        self._background_tasks: Dict[str, asyncio.Task] = {}
+        self._task_counter = 0
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        
+        self._setup_signal_handlers()
+        self._setup_readline()
+        self._register_builtins()
+    
+    def _setup_signal_handlers(self):
+        """Setup signal handlers"""
+        def signal_handler(sig, frame):
+            print("\n^C")
+            if self._running:
+                # Cancel all background tasks
+                for task in self._background_tasks.values():
+                    task.cancel()
+            else:
+                sys.exit(0)
+        
+        signal.signal(signal.SIGINT, signal_handler)
+    
+    def _setup_readline(self):
+        """Setup readline for history and completion"""
+        if not self.enable_history:
+            return
+        
+        try:
+            if self.history_file:
+                try:
+                    readline.read_history_file(self.history_file)
+                except FileNotFoundError:
+                    pass
+            
+            readline.parse_and_bind("tab: complete")
+            readline.set_completer(self._completer)
+        except Exception as e:
+            print(f"Warning: Could not setup readline: {e}", file=sys.stderr)
+    
+    def _completer(self, text: str, state: int) -> Optional[str]:
+        """Tab completion for command names"""
+        options = [cmd for cmd in self._commands.keys() if cmd.startswith(text)]
+        
+        for metadata in self._commands.values():
+            options.extend([alias for alias in metadata.aliases if alias.startswith(text)])
+        
+        try:
+            return options[state]
+        except IndexError:
+            return None
+    
+    def _register_builtins(self):
+        """Register built-in commands"""
+        
+        @self.command(name="help", description="Show available commands", aliases=["?"])
+        def help_cmd(ctx: CommandContext):
+            if ctx.args:
+                cmd_name = ctx.args[0]
+                if cmd_name in self._commands:
+                    meta = self._commands[cmd_name]
+                    print(f"\n{meta.name}: {meta.description}")
+                    if meta.usage:
+                        print(f"Usage: {meta.usage}")
+                    if meta.aliases:
+                        print(f"Aliases: {', '.join(meta.aliases)}")
+                    print(f"Type: {'async' if meta.is_async else 'sync'}")
+                else:
+                    print(f"Unknown command: {cmd_name}")
+            else:
+                print("\nAvailable commands:")
+                for name, meta in sorted(self._commands.items()):
+                    if not meta.hidden:
+                        aliases = f" ({', '.join(meta.aliases)})" if meta.aliases else ""
+                        async_marker = "[async]" if meta.is_async else ""
+                        print(f"  {name}{aliases:20s} {async_marker:8s} - {meta.description}")
+                print("\nType 'help <command>' for more details")
+            return CommandResult.SUCCESS
+        
+        @self.command(name="exit", description="Exit the REPL", aliases=["quit", "q"])
+        def exit_cmd(ctx: CommandContext):
+            print("Goodbye!")
+            return CommandResult.EXIT
+        
+        @self.command(name="tasks", description="Show background tasks")
+        def tasks_cmd(ctx: CommandContext):
+            if not self._background_tasks:
+                print("No background tasks running")
+                return CommandResult.SUCCESS
+            
+            print("\nBackground tasks:")
+            for name, task in self._background_tasks.items():
+                status = "running" if not task.done() else "done"
+                print(f"  {name:20s} - {status}")
+            return CommandResult.SUCCESS
+        
+        @self.command(name="cancel", description="Cancel a background task", usage="cancel <task_name>")
+        def cancel_cmd(ctx: CommandContext):
+            if not ctx.args:
+                print("Usage: cancel <task_name>")
+                return CommandResult.ERROR
+            
+            task_name = ctx.args[0]
+            if task_name in self._background_tasks:
+                self._background_tasks[task_name].cancel()
+                print(f"Cancelled task: {task_name}")
+                return CommandResult.SUCCESS
+            else:
+                print(f"Task not found: {task_name}")
+                return CommandResult.ERROR
+        
+        @self.command(name="history", description="Show command history", hidden=True)
+        def history_cmd(ctx: CommandContext):
+            if not self.enable_history:
+                print("History is disabled")
+                return CommandResult.ERROR
+            
+            count = int(ctx.args[0]) if ctx.args else 20
+            history_length = readline.get_current_history_length()
+            start = max(1, history_length - count + 1)
+            
+            for i in range(start, history_length + 1):
+                print(f"{i:4d}  {readline.get_history_item(i)}")
+            
+            return CommandResult.SUCCESS
+    
+    def command(
+        self,
+        name: str,
+        description: str = "",
+        usage: str = "",
+        aliases: Optional[List[str]] = None,
+        hidden: bool = False
+    ):
+        """
+        Decorator to register a command (sync or async)
+        
+        @repl.command(name="mycommand", description="Does something")
+        async def my_async_command(ctx: CommandContext):
+            await asyncio.sleep(1)
+            print("Done!")
+            return CommandResult.SUCCESS
+        """
+        def decorator(func: Callable):
+            is_async = asyncio.iscoroutinefunction(func)
+            
+            metadata = CommandMetadata(
+                func=func,
+                name=name,
+                description=description,
+                usage=usage,
+                aliases=aliases or [],
+                hidden=hidden,
+                is_async=is_async
+            )
+            
+            self._commands[name] = metadata
+            
+            for alias in (aliases or []):
+                self._commands[alias] = metadata
+            
+            return func
+        
+        return decorator
+    
+    def add_startup_hook(self, func: Callable):
+        """Add hook to run at startup"""
+        self._startup_hooks.append(func)
+        return func  # Return func so it can be used as decorator
+    
+    def add_shutdown_hook(self, func: Callable):
+        """Add hook to run at shutdown"""
+        self._shutdown_hooks.append(func)
+        return func
+    
+    def add_pre_execute_hook(self, func: Callable):
+        """Add hook to run before each command"""
+        self._pre_execute_hooks.append(func)
+        return func
+    
+    def add_post_execute_hook(self, func: Callable):
+        """Add hook to run after each command"""
+        self._post_execute_hooks.append(func)
+        return func
+    
+    def create_background_task(
+        self,
+        coro: Coroutine,
+        name: Optional[str] = None
+    ) -> asyncio.Task:
+        """
+        Create a background task that runs independently of commands.
+        
+        Usage:
+            task = repl.create_background_task(my_async_function(), "my_task")
+        """
+        if name is None:
+            self._task_counter += 1
+            name = f"task_{self._task_counter}"
+        
+        task = asyncio.create_task(coro)
+        self._background_tasks[name] = task
+        
+        # Clean up when done
+        def cleanup(t):
+            if name in self._background_tasks:
+                del self._background_tasks[name]
+        
+        task.add_done_callback(cleanup)
+        
+        print(f"[Background task started: {name}]")
+        return task
+    
+    async def _get_input_async(self) -> str:
+        """Get input asynchronously without blocking the event loop"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self._executor, input, self.prompt)
+    
+    def _parse_input(self, raw_input: str) -> tuple[str, List[str]]:
+        """Parse input into command and arguments"""
+        parts = raw_input.strip().split()
+        if not parts:
+            return "", []
+        return parts[0], parts[1:]
+    
+    async def _execute_command(self, raw_input: str) -> CommandResult:
+        """Execute a single command (async or sync)"""
+        cmd_name, args = self._parse_input(raw_input)
+        
+        if not cmd_name:
+            return CommandResult.SUCCESS
+        
+        if cmd_name not in self._commands:
+            print(f"Unknown command: {cmd_name}")
+            print("Type 'help' for available commands")
+            return CommandResult.ERROR
+        
+        # Create context with REPL reference
+        ctx = CommandContext(
+            args=args,
+            raw_input=raw_input,
+            session_data=self._session_data,
+            repl_instance=self
+        )
+        
+        # Run pre-execute hooks
+        for hook in self._pre_execute_hooks:
+            try:
+                if asyncio.iscoroutinefunction(hook):
+                    await hook(ctx)
+                else:
+                    hook(ctx)
+            except Exception as e:
+                print(f"Pre-execute hook error: {e}", file=sys.stderr)
+        
+        # Execute command
+        try:
+            metadata = self._commands[cmd_name]
+            
+            if metadata.is_async:
+                result = await metadata.func(ctx)
+            else:
+                result = metadata.func(ctx)
+            
+            if not isinstance(result, CommandResult):
+                result = CommandResult.SUCCESS
+        
+        except KeyboardInterrupt:
+            print("\n^C")
+            result = CommandResult.ERROR
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
+            result = CommandResult.ERROR
+        
+        # Run post-execute hooks
+        for hook in self._post_execute_hooks:
+            try:
+                if asyncio.iscoroutinefunction(hook):
+                    await hook(ctx, result)
+                else:
+                    hook(ctx, result)
+            except Exception as e:
+                print(f"Post-execute hook error: {e}", file=sys.stderr)
+        
+        return result
+    
+    async def run_async(self):
+        """Main async REPL loop"""
+        self._running = True
+        
+        # Run startup hooks
+        for hook in self._startup_hooks:
+            try:
+                if asyncio.iscoroutinefunction(hook):
+                    await hook(self)
+                else:
+                    hook(self)
+            except Exception as e:
+                print(f"Startup hook error: {e}", file=sys.stderr)
+        
+        print("Type 'help' for available commands, 'exit' to quit")
+        
+        try:
+            while self._running:
+                try:
+                    # Read input asynchronously
+                    raw_input = await self._get_input_async()
+                    raw_input = raw_input.strip()
+                    
+                    if not raw_input:
+                        continue
+                    
+                    # Eval & Print
+                    result = await self._execute_command(raw_input)
+                    
+                    # Check for exit
+                    if result == CommandResult.EXIT:
+                        break
+                
+                except KeyboardInterrupt:
+                    print()
+                    continue
+                
+                except EOFError:
+                    print("\nGoodbye!")
+                    break
+        
+        finally:
+            self._running = False
+            
+            # Cancel all background tasks
+            print("\nCancelling background tasks...")
+            for task in self._background_tasks.values():
+                task.cancel()
+            
+            # Wait for tasks to finish
+            if self._background_tasks:
+                await asyncio.gather(*self._background_tasks.values(), return_exceptions=True)
+            
+            # Save history
+            if self.enable_history and self.history_file:
+                try:
+                    readline.write_history_file(self.history_file)
+                except Exception as e:
+                    print(f"Warning: Could not save history: {e}", file=sys.stderr)
+            
+            # Run shutdown hooks
+            for hook in self._shutdown_hooks:
+                try:
+                    if asyncio.iscoroutinefunction(hook):
+                        await hook(self)
+                    else:
+                        hook(self)
+                except Exception as e:
+                    print(f"Shutdown hook error: {e}", file=sys.stderr)
+            
+            # Cleanup executor
+            self._executor.shutdown(wait=False)
+    
+    def run(self):
+        """Synchronous entry point that runs the async REPL"""
+        asyncio.run(self.run_async())
+
+
+# Example usage
+if __name__ == "__main__":
+    repl = AsyncREPLEngine(prompt="async> ", history_file=".repl_history")
+    
+    # Example: Async command that emits a background task
+    @repl.command(name="countdown", description="Start a countdown in the background")
+    async def countdown_cmd(ctx: CommandContext):
+        count = int(ctx.args[0]) if ctx.args else 10
+        
+        async def countdown_task():
+            for i in range(count, 0, -1):
+                print(f"\r[Countdown: {i}]", end="", flush=True)
+                await asyncio.sleep(1)
+            print("\r[Countdown: Done!]")
+        
+        ctx.emit_task(countdown_task(), f"countdown_{count}")
+        return CommandResult.SUCCESS
+    
+    # Example: Async command
+    @repl.command(name="fetch", description="Simulate fetching data")
+    async def fetch_cmd(ctx: CommandContext):
+        url = ctx.args[0] if ctx.args else "example.com"
+        print(f"Fetching {url}...")
+        await asyncio.sleep(2)  # Simulate network delay
+        print(f"Fetched {url}")
+        return CommandResult.SUCCESS
+    
+    # Example: Sync command
+    @repl.command(name="echo", description="Echo arguments")
+    def echo_cmd(ctx: CommandContext):
+        print(" ".join(ctx.args))
+        return CommandResult.SUCCESS
+    
+    # Example: Background monitoring task
+    async def monitor_task():
+        """This runs continuously in the background"""
+        while True:
+            await asyncio.sleep(5)
+            # could monitor system state, check queues, etc.
+            # print("\n[Monitor: Checking system...]")
+    
+    # Start monitoring on startup
+    @repl.add_startup_hook
+    async def start_monitoring(repl_instance):
+        # repl_instance.create_background_task(monitor_task(), "monitor")
+        pass
+    
+    repl.run()
