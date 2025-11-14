@@ -126,4 +126,4 @@ Do whatever you want with it. Just don't blame me if something breaks. See LICEN
 
 ---
 
-Made by a college student trying to figure out async Python • Last updated: November 2025
+Last updated: November 2025
